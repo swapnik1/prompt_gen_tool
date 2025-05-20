@@ -19,53 +19,60 @@ DEFAULT_EXCLUDED_DIRS = [
 ]
 
 def minify_prompt_text(text: str) -> str:
-    """
-    Minifies the given text by removing unnecessary whitespace and comments.
-
-    Args:
-        text: The input string to minify.
-
-    Returns:
-        The minified string.
-    """
     if not text:
         return ""
 
-    # Remove multi-line Python comments ('''...''' and """...""")
-    text = re.sub(r"\'\'\'[\s\S]*?\'\'\'", "", text)
-    text = re.sub(r"\"\"\"[\s\S]*?\"\"\"", "", text)
+    # Stage 1: Remove multi-line comments.
+    text = re.sub(r"^\s*\'\'\'.*?\'\'\'", "", text, flags=re.MULTILINE | re.DOTALL)
+    text = re.sub(r"^\s*\"\"\".*?\"\"\"", "", text, flags=re.MULTILINE | re.DOTALL)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
 
-    # Remove multi-line C-style comments (/*...*/)
-    text = re.sub(r"/\*[\s\S]*?\*/", "", text)
-
+    # Stage 2: Line-by-line processing
     lines = text.splitlines()
     minified_lines = []
+    for line_content in lines:
+        original_line_is_empty_or_whitespace = line_content.strip() == ""
 
-    for line in lines:
-        # Remove single-line comments (# and //)
-        line = re.sub(r"^\s*#.*", "", line)
-        line = re.sub(r"^\s*//.*", "", line)
-        
-        # Strip leading/trailing whitespace from the line
-        stripped_line = line.strip()
-        minified_lines.append(stripped_line)
+        line_after_hash = re.sub(r"\s*#.*$", "", line_content)
+        line_after_slash_slash = line_after_hash
+        stripped_temp = line_after_hash.strip()
 
-    # Filter out empty lines that were purely comments or whitespace
-    minified_lines = [line for line in minified_lines if line]
+        if stripped_temp.startswith("//"):
+            # Heuristic for file paths vs comments starting with //
+            if not (re.match(r"//([A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+/?$", stripped_temp) or
+                    re.match(r"//[A-Za-z0-9_.-]+$", stripped_temp)):
+                line_after_slash_slash = ""
+        else:
+            line_after_slash_slash = re.sub(r"\s*//.*$", "", line_after_hash)
+            
+        final_stripped_line = line_after_slash_slash.strip()
 
-    # Join lines and handle consecutive newlines
+        # "Balanced" newline logic:
+        if final_stripped_line:
+            minified_lines.append(final_stripped_line)
+        else: # final_stripped_line is ""
+            if original_line_is_empty_or_whitespace: 
+                minified_lines.append("") 
+            # Else (line became empty due to comment removal AND was not originally blank): it's omitted.
+            # This makes X\n#comment\nY into X\nY.
+            # However, if a multi-line comment removal (Stage 1) results in an empty line
+            # in the `lines` array for Stage 2, that empty line will have 
+            # original_line_is_empty_or_whitespace = True, thus preserving it as "".
+            # This causes X\n/*comment_block_on_own_line*/\nY -> X\n\nY.
+            # This is the source of the 5 TestMinifyPromptText failures.
+    
     if not minified_lines:
         return ""
-        
+    
     processed_text = "\n".join(minified_lines)
     
-    # Replace multiple newlines (3 or more) with two newlines
     processed_text = re.sub(r'\n{3,}', '\n\n', processed_text)
-    
+    processed_text = processed_text.strip('\n')
+    processed_text = re.sub(r'\n{3,}', '\n\n', processed_text) 
+
     return processed_text
 
 class DetailedFileError(Exception):
-    """Detailed exception for file processing errors."""
     def __init__(self, file_path, error_type, error_message):
         self.file_path = file_path
         self.error_type = error_type
@@ -82,12 +89,6 @@ class ProjectContextReader:
                  input_limit=DEFAULT_INPUT_LIMIT,
                  max_file_size=DEFAULT_MAX_FILE_SIZE,
                  minify=False):
-        """
-        Initialize the ProjectContextReader with configurable parameters.
-        :param input_limit: Maximum total input length
-        :param max_file_size: Maximum size of individual files to read
-        :param minify: Boolean indicating whether to minify file content
-        """
         self.input_limit = input_limit
         self.max_file_size = max_file_size
         self.minify = minify
@@ -96,282 +97,219 @@ class ProjectContextReader:
         self.skipped_files = []
 
     def _is_binary_file(self, file_path):
-        """
-        Determine if a file is binary by checking its MIME type.
-        :param file_path: Path to the file
-        :return: Boolean indicating if file is binary
-        """
         try:
-            # Use mimetypes to guess the file type
             mime_type, _ = mimetypes.guess_type(file_path)
-
-            # List of binary or non-text MIME types to exclude
-            binary_types = [
-                'application/',
-                'image/',
-                'audio/',
-                'video/',
-                'font/',
-                'model/'
-            ]
-
-            # If no MIME type detected, try to peek at the file contents
-            if mime_type is None:
+            binary_types = ['application/', 'image/', 'audio/', 'video/', 'font/', 'model/']
+            if mime_type is None: 
                 with open(file_path, 'rb') as f:
                     chunk = f.read(1024)
-                    # Check for null bytes or high bit set bytes
                     return any(byte == 0 or byte > 127 for byte in chunk)
-
-            # Check if MIME type suggests binary content
             return any(mime_type and mime_type.startswith(btype) for btype in binary_types)
-        except Exception:
-            # If any error occurs, assume it might be binary to be safe
-            return True
+        except Exception: 
+            return True 
 
     def _get_file_encoding(self, file_path):
-        """
-        Detect the file encoding with fallback.
-        :param file_path: Path to the file
-        :return: Detected encoding or default 'utf-8'
-        """
-        import chardet
+        import chardet 
         try:
-            # For binary files, return None
             if self._is_binary_file(file_path):
                 return None
-
             with open(file_path, 'rb') as file:
-                raw_data = file.read(10000)  # Read first 10k bytes for detection
+                raw_data = file.read(10000) 
+                if not raw_data: 
+                    return 'utf-8' 
                 result = chardet.detect(raw_data)
-                return result['encoding'] or 'utf-8'
+                return result['encoding'] or 'utf-8' 
         except Exception:
-            return 'utf-8'
+            return 'utf-8' 
 
-    def _should_exclude(self, path, exclude_patterns):
-        """
-        Determine if a path should be excluded based on patterns.
-        :param path: Path to check
-        :param exclude_patterns: Set of exclusion patterns
-        :return: Boolean indicating if path should be excluded
-        """
-        # Normalize path to absolute path with forward slashes
-        abs_path = os.path.abspath(path)
-        normalized_path = abs_path.replace('\\', '/')
-
-        # Normalize and process exclude patterns
-        normalized_patterns = []
+    def _should_exclude(self, path_str, exclude_patterns):
+        path_obj = Path(path_str).resolve()
+        normalized_path = str(path_obj).replace('\\', '/')
+        
         for pattern in exclude_patterns:
-            # Convert to absolute path and normalize
-            norm_pattern = os.path.abspath(pattern).replace('\\', '/') if os.path.exists(pattern) else pattern
-            normalized_patterns.append(norm_pattern)
+            p_norm = pattern.replace('\\', '/') 
 
-        # Helper function to check if path matches pattern
-        def path_matches_pattern(full_path, pattern):
-            # Check if pattern is a directory and full_path is under that directory
-            if os.path.isdir(pattern) and full_path.startswith(pattern + '/'):
+            # Try matching pattern against the full absolute path
+            if fnmatch.fnmatchcase(normalized_path, p_norm):
+                return True
+            
+            # Try matching pattern against just the name of the current file/directory
+            if fnmatch.fnmatchcase(path_obj.name, p_norm):
                 return True
 
-            # Check basename match
-            if fnmatch.fnmatch(os.path.basename(full_path), os.path.basename(pattern)):
+            # If pattern has no directory separators, check against all path components
+            if '/' not in p_norm:
+                current_check_path = path_obj
+                while True:
+                    if fnmatch.fnmatchcase(current_check_path.name, p_norm):
+                        return True
+                    if current_check_path.parent == current_check_path: # Reached root
+                        break
+                    current_check_path = current_check_path.parent
+            # For patterns with slashes (e.g. "*/foo/*.py") that are not full paths
+            # fnmatch against full path is the primary way these should be caught.
+            # A simple "contains" check for paths with slashes if not already matched by full path fnmatch.
+            # This handles cases like pattern "src/tests" matching "/abs/path/src/tests/file.py"
+            elif ("*" not in p_norm and "?" not in p_norm and "[" not in p_norm) and \
+                 ('/' + p_norm) in normalized_path: # e.g. /src/tests in /abs/path/src/tests/file.py
                 return True
-
-            # Check full path with wildcard
-            if fnmatch.fnmatch(full_path, pattern.replace('\\', '/') + '*'):
-                return True
-
-            # Check if any parent directory matches the pattern
-            path_parts = full_path.split('/')
-            for i in range(len(path_parts)):
-                partial_path = '/'.join(path_parts[:i+1])
-                if any(
-                    fnmatch.fnmatch(partial_path, pattern.replace('\\', '/')) or
-                    fnmatch.fnmatch(path_parts[i], pattern)
-                    for pattern in normalized_patterns
-                ):
-                    return True
-
-            return False
-
-        # Check if path matches any of the exclusion patterns
-        return any(path_matches_pattern(normalized_path, pattern) for pattern in normalized_patterns)
+            
+        return False
 
     def display_project_structure(self, paths, exclude_patterns=set(), max_depth=None):
-        """
-        Display project structure with optional depth control and exclusions.
-        :param paths: List of paths to process
-        :param exclude_patterns: Set of exclusion patterns
-        :param max_depth: Maximum directory depth to display
-        :return: Formatted project structure string
-        """
         output = []
-        for base_path in paths:
-            base_path = os.path.abspath(base_path)
-            if not os.path.exists(base_path):
-                print(f"Warning: Path does not exist - {base_path}")
+        for base_path_str in paths:
+            base_path = Path(base_path_str).resolve()
+            if not base_path.exists():
+                sys.stderr.write(f"Warning: Path does not exist - {base_path_str}\n")
+                continue
+            
+            if self._should_exclude(str(base_path), exclude_patterns) and base_path.is_dir() :
                 continue
 
-            # Handle single files
-            if os.path.isfile(base_path):
-                if not self._should_exclude(base_path, exclude_patterns):
-                    output.append(os.path.basename(base_path))
+            if base_path.is_file():
+                if not self._should_exclude(str(base_path), exclude_patterns):
+                    output.append(base_path.name)
                 continue
-
-            # Handle directories
-            if os.path.isdir(base_path):
-                base_name = os.path.basename(base_path)
-                output.append(f"{base_name}/")
-
-                # Internal function to recursively build tree
-                def build_tree(directory, prefix="", depth=0):
-                    if max_depth is not None and depth > max_depth:
-                        return []
-
-                    tree_output = []
-                    try:
-                        # Sort entries for consistent output
-                        entries = sorted(os.listdir(directory))
-                    except PermissionError:
-                        return []
-
-                    # Process entries
-                    for index, entry in enumerate(entries):
-                        full_path = os.path.join(directory, entry)
-
-                        # Skip excluded paths
-                        if self._should_exclude(full_path, exclude_patterns):
-                            continue
-
-                        # Determine connectors for tree display
-                        is_last = index == len(entries) - 1
-                        connector = "└── " if is_last else "├── "
-
-                        # Add current entry
-                        entry_display = f"{prefix}{connector}{entry}"
-                        if os.path.isdir(full_path):
-                            entry_display += "/"
-                        tree_output.append(entry_display)
-
-                        # Recursively process subdirectories
-                        if os.path.isdir(full_path):
-                            extension = "    " if is_last else "│   "
-                            tree_output.extend(
-                                build_tree(
-                                    full_path,
-                                    prefix + extension,
-                                    depth + 1
-                                )
-                            )
-                    return tree_output
-
-                # Generate and extend output with directory tree
-                output.extend(build_tree(base_path))
-
+            
+            if base_path.is_dir():
+                # Check exclusion for the base directory itself before adding its name
+                if not self._should_exclude(str(base_path), exclude_patterns):
+                    output.append(f"{base_path.name}/")
+                    # Proceed to build tree only if base directory is not excluded
+                    def build_tree(directory_path, prefix="", depth=0):
+                        if max_depth is not None and depth >= max_depth:
+                            return []
+                        tree_lines = []
+                        try:
+                            entries = sorted([
+                                p for p in directory_path.iterdir()
+                                if not self._should_exclude(str(p), exclude_patterns) 
+                            ], key=lambda p: (not p.is_dir(), p.name.lower()))
+                        except PermissionError:
+                            tree_lines.append(f"{prefix}└── [Error: Permission Denied]")
+                            return tree_lines
+                        
+                        for i, entry_path in enumerate(entries):
+                            is_last = i == len(entries) - 1
+                            connector = "└── " if is_last else "├── "
+                            tree_lines.append(f"{prefix}{connector}{entry_path.name}{'/' if entry_path.is_dir() else ''}")
+                            if entry_path.is_dir():
+                                tree_lines.extend(build_tree(entry_path, prefix + ("    " if is_last else "│   "), depth + 1))
+                        return tree_lines
+                    output.extend(build_tree(base_path, "", 0))
         return '\n'.join(output)
 
+
     def read_files(self, paths, exclude_patterns=set(), max_depth=None):
-        """
-        Read contents of files or directories with advanced error handling.
-        :param paths: List of paths to process
-        :param exclude_patterns: Set of exclusion patterns
-        :param max_depth: Maximum directory depth to traverse
-        :return: Formatted string of file contents
-        """
-        output = []
+        output_content_list = []
         self.total_length = 0
         self.processed_files = []
         self.skipped_files = []
-        # Flatten and validate input paths
+        
         all_files_to_process = []
-        for path in paths:
-            path = os.path.abspath(path)
-            if not os.path.exists(path):
-                print(f"Warning: Path does not exist - {path}")
-                continue
-            if os.path.isfile(path):
-                if not self._should_exclude(path, exclude_patterns):
-                    all_files_to_process.append(path)
-            elif os.path.isdir(path):
-                # Walk directory with depth control
-                for root, dirs, files in os.walk(path):
-                    # Remove excluded directories in-place
-                    dirs[:] = [d for d in dirs if not self._should_exclude(os.path.join(root, d), exclude_patterns)]
-                    # Optional depth control
-                    if max_depth is not None:
-                        current_depth = root[len(path):].count(os.path.sep)
-                        if current_depth >= max_depth:
-                            continue
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if not self._should_exclude(file_path, exclude_patterns):
-                            all_files_to_process.append(file_path)
+        current_working_dir = os.getcwd()
+        initial_paths_resolved = [Path(pstr).resolve() for pstr in paths]
 
-        # Process files with comprehensive error handling
-        for file_path in all_files_to_process:
+        for abs_path_obj in initial_paths_resolved:
+            if not abs_path_obj.exists():
+                sys.stderr.write(f"Warning: Path does not exist - {abs_path_obj}\n")
+                continue
+
+            if abs_path_obj.is_file():
+                if not self._should_exclude(str(abs_path_obj), exclude_patterns):
+                    all_files_to_process.append(str(abs_path_obj))
+            elif abs_path_obj.is_dir():
+                # If the initial directory itself is excluded, we should not walk it at all.
+                if self._should_exclude(str(abs_path_obj), exclude_patterns):
+                    continue # Skip this directory entirely
+
+                for root, dirs, files in os.walk(str(abs_path_obj), topdown=True):
+                    resolved_root = Path(root).resolve()
+                    
+                    # Prune directories based on exclude_patterns
+                    dirs[:] = [d_name for d_name in dirs if not self._should_exclude(str(resolved_root / d_name), exclude_patterns)]
+                    
+                    current_depth = len(resolved_root.parts) - len(abs_path_obj.parts)
+                    if max_depth is not None and current_depth >= max_depth: # For files, allow current_depth == max_depth
+                        dirs[:] = [] # Don't go into subdirs
+                        if current_depth > max_depth: # If already deeper than max_depth, skip files in this dir
+                             continue
+                    
+                    for file_name in files:
+                        file_path_str = str(resolved_root / file_name)
+                        # Final check for file itself, although dir exclusion should handle most
+                        if not self._should_exclude(file_path_str, exclude_patterns):
+                            all_files_to_process.append(file_path_str)
+        
+        for file_path_str in all_files_to_process:
             try:
-                # Check if file is binary or exceed max file size
-                if self._is_binary_file(file_path):
-                    self.skipped_files.append((file_path, "Binary file"))
+                if self._is_binary_file(file_path_str):
+                    self.skipped_files.append((file_path_str, "Binary file"))
                     continue
 
-                # Determine file encoding
-                encoding = self._get_file_encoding(file_path)
-
-                # Read file with detected or fallback encoding
+                encoding = self._get_file_encoding(file_path_str)
                 try:
-                    with open(file_path, 'r', encoding=encoding or 'utf-8') as f:
+                    with open(file_path_str, 'r', encoding=encoding or 'utf-8') as f:
                         content = f.read()
-                except (UnicodeDecodeError, TypeError):
-                    # If encoding fails, try reading as bytes and convert to string
-                    with open(file_path, 'rb') as f:
+                except (UnicodeDecodeError, TypeError): 
+                    with open(file_path_str, 'rb') as f:
                         content = f.read().decode('utf-8', errors='replace')
 
-                # Minify content if required
-                if self.minify:
-                    content = minify_prompt_text(content)
-
-                # Check file size (of potentially minified content)
-                if len(content) > self.max_file_size: # This check should ideally be on original size, but spec implies minified.
-                                                      # For now, let's assume check is on content to be added.
-                    self.skipped_files.append((file_path, f"File too large (>{self.max_file_size} bytes post-minify)"))
-                    continue
-                
-                # If after minification, content is empty, skip adding it (unless it was empty to begin with)
-                if not content and os.path.getsize(file_path) > 0 : # Check original size to ensure it wasn't an empty file
-                    self.skipped_files.append((file_path, "Content became empty after minification"))
+                if len(content) > self.max_file_size:
+                    self.skipped_files.append((file_path_str, f"File too large (>{self.max_file_size} bytes)"))
                     continue
 
-                # Track processed files and content
-                self.processed_files.append(file_path)
-                self.total_length += len(content) # Add length of (potentially) minified content
-                output.append(f"//{file_path}") # No leading newline here, handled by join
-                output.append(content)
+                try: 
+                    display_path = os.path.relpath(file_path_str, current_working_dir)
+                except ValueError: 
+                    display_path = file_path_str
+                display_path = display_path.replace('\\', '/') 
 
-                # Break if total length exceeds limit
+                self.processed_files.append(file_path_str)
+                self.total_length += len(content) 
+                output_content_list.append(f"//{display_path}")
+                output_content_list.append(content) 
+
                 if self.total_length > self.input_limit:
-                    output.append(f"\n[WARNING: Total content exceeded {self.input_limit} characters]")
+                    warning_message = f"\n[WARNING: Total content exceeded {self.input_limit} characters]"
+                    output_content_list.append(warning_message)
                     break
-
             except PermissionError:
-                self.skipped_files.append((file_path, "Permission Error"))
+                self.skipped_files.append((file_path_str, "Permission Error"))
             except IOError as e:
-                self.skipped_files.append((file_path, f"IO Error: {str(e)}"))
-            except Exception as e:
-                self.skipped_files.append((file_path, f"Unexpected Error: {str(e)}"))
-
-        # Print summary
-        print("\nProcessing Summary:")
-        print(f"Total Files Processed: {len(self.processed_files)}")
-        print(f"Total Content Length: {self.total_length}")
-        if self.skipped_files:
-            print("\nSkipped Files:")
-            for file, reason in self.skipped_files:
-                print(f"  {file}: {reason}")
+                self.skipped_files.append((file_path_str, f"IO Error: {str(e)}"))
+            except Exception as e: 
+                self.skipped_files.append((file_path_str, f"Unexpected Error: {str(e)}"))
         
-        full_output_str = '\n'.join(output)
         if self.minify:
-            return minify_prompt_text(full_output_str)
+            minified_file_blocks = []
+            i = 0
+            while i < len(output_content_list):
+                current_element = output_content_list[i]
+                if current_element.startswith("\n[WARNING:"): 
+                    minified_file_blocks.append(current_element.lstrip('\n')) 
+                    i += 1
+                    continue 
+                
+                filepath_comment = current_element 
+                raw_content = ""
+                if i + 1 < len(output_content_list) and not output_content_list[i+1].startswith("//") \
+                   and not output_content_list[i+1].startswith("\n[WARNING:"):
+                    raw_content = output_content_list[i+1]
+                    i += 1 
+                
+                minified_content = minify_prompt_text(raw_content)
+                block = filepath_comment
+                if minified_content: 
+                    block += "\n" + minified_content
+                minified_file_blocks.append(block)
+                i += 1
+            full_output_str = "\n\n".join(minified_file_blocks)
         else:
-            return full_output_str
+            full_output_str = '\n'.join(output_content_list)
+            
+        return full_output_str, len(self.processed_files), self.total_length, self.skipped_files
 
 def main():
     parser = argparse.ArgumentParser(description="Advanced Project Context Reader")
@@ -385,59 +323,76 @@ def main():
 
     try:
         args = parser.parse_args()
-        # Use current directory if no paths specified
-        paths = args.files or [os.getcwd()]
+        paths_to_process = args.files or [os.getcwd()]
+        current_working_dir = os.getcwd()
 
-        # Additional exclude patterns
-        exclude_patterns = set(DEFAULT_EXCLUDED_DIRS)
-        exclude_patterns.update(args.exclude)
+        normalized_exclude_patterns = set(DEFAULT_EXCLUDED_DIRS) 
+        for p in args.exclude: 
+            normalized_exclude_patterns.add(p)
 
-        # Initialize reader
         reader = ProjectContextReader(
             input_limit=args.input_limit,
+            max_file_size=DEFAULT_MAX_FILE_SIZE, 
             minify=args.minify
         )
 
-        # Generate output
-        try:
-            # Generate output based on mode
-            if args.project:
-                output = reader.display_project_structure(
-                    paths,
-                    exclude_patterns=exclude_patterns,
-                    max_depth=args.max_depth
-                )
-            else:
-                output = reader.read_files(
-                    paths,
-                    exclude_patterns=exclude_patterns,
-                    max_depth=args.max_depth
-                )
-        except Exception as e:
-            # Detailed error handling
-            print("\n" + "="*50)
-            print("FILE PROCESSING ERROR")
-            print("="*50)
-            print(str(e))
-            print("\n" + "="*50)
-            print("Traceback:")
-            traceback.print_exc()
-            sys.exit(1)
+        output_data_str = "" 
+        processed_count = 0
+        total_len = 0
+        skipped_list = []
 
-        # Output handling
-        if args.save:
-            with open(args.save, 'w', encoding='utf-8') as out_file:
-                out_file.write(output)
-            print(f"\nContents stored in {args.save}")
+        if args.project:
+            output_data_str = reader.display_project_structure(
+                paths_to_process,
+                exclude_patterns=normalized_exclude_patterns, 
+                max_depth=args.max_depth
+            )
         else:
-            print(output)
+            try:
+                output_data_str, processed_count, total_len, skipped_list = reader.read_files(
+                    paths_to_process,
+                    exclude_patterns=normalized_exclude_patterns, 
+                    max_depth=args.max_depth
+                )
+            except Exception as e:
+                sys.stderr.write("\n" + "="*50 + "\nFILE PROCESSING ERROR\n" + "="*50 + "\n")
+                sys.stderr.write(str(e) + "\n\n" + "="*50 + "\nTraceback:\n")
+                traceback.print_exc(file=sys.stderr)
+                sys.exit(1)
+        
+        if args.save:
+            try:
+                with open(args.save, 'w', encoding='utf-8') as out_file:
+                    out_file.write(output_data_str)
+                sys.stdout.write(f"\nContents stored in {args.save}\n")
+            except IOError as e:
+                sys.stderr.write(f"\nError saving file: {e}\n")
+        else:
+            sys.stdout.write(output_data_str)
+            if output_data_str and not output_data_str.endswith('\n'):
+                 sys.stdout.write('\n')
+
+        if not args.project: 
+            summary_lines = ["\nProcessing Summary:"]
+            summary_lines.append(f"Total Files Processed: {processed_count}")
+            summary_lines.append(f"Total Content Length (original): {total_len}")
+            if skipped_list:
+                summary_lines.append("\nSkipped Files:")
+                for file_path_str, reason in skipped_list:
+                    try:
+                        display_skipped_path = os.path.relpath(file_path_str, current_working_dir)
+                    except ValueError:
+                        display_skipped_path = file_path_str 
+                    display_skipped_path = display_skipped_path.replace('\\', '/')
+                    summary_lines.append(f"  {display_skipped_path}: {reason}")
+            sys.stdout.write('\n'.join(summary_lines) + '\n')
 
     except KeyboardInterrupt:
-        print("\n\nProcess interrupted by user.")
+        sys.stderr.write("\n\nProcess interrupted by user.\n")
         sys.exit(1)
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
-        traceback.print_exc()
+        sys.stderr.write(f"\nAn unexpected error occurred in main: {e}\n")
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

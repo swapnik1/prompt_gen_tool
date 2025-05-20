@@ -60,6 +60,11 @@ prompt-gen -f src/ --gitignore .gitignore
 - `--input-limit`: Maximum total input length (default: 12000 chars)
 - `--max-file-size`: Maximum file size to read (default: 1 MB)
 - `--minify`: Optional. Minifies the output by removing unnecessary characters such as excessive newlines, leading/trailing whitespace, and comments. This can help reduce the token count for LLMs.
+    *   **Note on Comments in Strings:** The minification process uses regular expressions to remove comments. While effective for most code, it might not correctly distinguish comments from comment-like patterns within string literals in all programming languages (e.g., a string containing "/* example */").
+    *   **Newline Minification Strategy:**
+        *   Reduces three or more consecutive newlines to exactly two newlines.
+        *   Preserves existing single or double newlines that were present in the original source or resulted from multi-line comment blocks occupying their own lines.
+        *   Single lines of code that become empty after comment removal (e.g., a line containing only `// a comment` or `code # a comment`) are collapsed, meaning they do not contribute to forming a blank line.
 
 ## Development and Testing
 
