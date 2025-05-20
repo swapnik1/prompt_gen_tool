@@ -188,3 +188,244 @@ def test_cli_integration():
     """
     # TODO: Implement CLI integration tests
     pass
+
+# --- Tests for minify_prompt_text ---
+from prompt_gen.cli import minify_prompt_text
+import unittest # For structuring tests, pytest will still run them
+
+class TestMinifyPromptText(unittest.TestCase):
+    def test_empty_input(self):
+        self.assertEqual(minify_prompt_text(""), "")
+
+    def test_excessive_newlines(self):
+        self.assertEqual(minify_prompt_text("a\n\n\nb"), "a\n\nb")
+        self.assertEqual(minify_prompt_text("a\n\n\n\n\nc"), "a\n\nc")
+        self.assertEqual(minify_prompt_text("\n\n\na\n\nb\n\n\n"), "a\n\nb") # Leading/trailing newlines handled by splitlines and join
+
+    def test_leading_trailing_whitespace(self):
+        self.assertEqual(minify_prompt_text("  line1  \n\tline2\t"), "line1\nline2")
+        self.assertEqual(minify_prompt_text("  \n  line1  \n\tline2\t\n  "), "line1\nline2")
+
+
+    def test_single_line_comments(self):
+        self.assertEqual(minify_prompt_text("# comment\nline1"), "line1")
+        self.assertEqual(minify_prompt_text("line1 // comment"), "line1")
+        self.assertEqual(minify_prompt_text("  # comment\n  line1  // comment 2"), "line1")
+        self.assertEqual(minify_prompt_text("line1  \n# comment\nline2"), "line1\nline2")
+        self.assertEqual(minify_prompt_text("line1\n// comment\nline2"), "line1\nline2")
+
+    def test_python_multi_line_comments(self):
+        self.assertEqual(minify_prompt_text("'''comment'''\nline1"), "line1")
+        self.assertEqual(minify_prompt_text('"""comment"""\nline1'), "line1")
+        self.assertEqual(minify_prompt_text("line1\n'''\nmultiline\ncomment\n'''\nline2"), "line1\nline2")
+        self.assertEqual(minify_prompt_text("line1\n\"\"\"\nmultiline\ncomment\n\"\"\"\nline2"), "line1\nline2")
+
+    def test_c_style_multi_line_comments(self):
+        self.assertEqual(minify_prompt_text("/*comment*/\nline1"), "line1")
+        self.assertEqual(minify_prompt_text("line1\n/*\nmultiline\ncomment\n*/\nline2"), "line1\nline2")
+
+    def test_mixed_comment_types(self):
+        source = """
+        # Python single line
+        line1 // C++ single line
+        ''' Python multi-line
+        comment
+        '''
+        line2
+        /* C-style multi-line
+           comment
+        */
+        line3
+        \"\"\"
+        Another Python multi-line
+        \"\"\"
+        """
+        expected = "line1\nline2\nline3"
+        self.assertEqual(minify_prompt_text(source), expected)
+
+    def test_already_minified(self):
+        source = "line1\nline2\n\nline3"
+        self.assertEqual(minify_prompt_text(source), source)
+
+    def test_comments_in_strings(self):
+        # Regex based approach will likely remove comments inside strings. This test acknowledges that.
+        source_py = 's = """\nthis is not a comment\n"""\n# but this is'
+        expected_py = 's = """\nthis is not a comment\n"""' # The minify function removes the # comment
+        self.assertEqual(minify_prompt_text(source_py), expected_py)
+        
+        source_js = 's = `/* this is not a comment */`; // but this is'
+        expected_js = 's = `/* this is not a comment */`;' # The minify function removes the // comment
+        # C-style multiline comments inside strings are tricky.
+        # The current regex for /* */ might remove it if it's not careful with string boundaries.
+        # Let's test the current behavior.
+        self.assertEqual(minify_prompt_text(source_js), expected_js)
+
+        source_c_multiline_in_string = 'const char* str = "/* not a comment */"; /* this is */'
+        # Depending on the regex order, /* */ inside string might be removed.
+        # Current implementation: /* */ is removed first, then //
+        # So "/* not a comment */" would become "" if not handled carefully by regex.
+        # The current regex r"/\*[\s\S]*?\*/" is greedy and will remove it.
+        # This is a known limitation.
+        # If the string itself was 'const char* str = "/* comment */";', it would be 'const char* str = "";'
+        # If the string is 'const char* str = "  /* comment */  ";', it would be 'const char* str = "    ";'
+        # The current function does not have context of programming language syntax.
+        expected_c_multiline_in_string = 'const char* str = "";' # Due to /* */ removal
+        self.assertEqual(minify_prompt_text(source_c_multiline_in_string), expected_c_multiline_in_string)
+
+
+    def test_whitespace_and_comments_only(self):
+        source = """
+        # comment
+        // another comment
+        /* multi-line
+           comment */
+        '''
+        python multi-line
+        '''
+        """
+        self.assertEqual(minify_prompt_text(source), "")
+        
+    def test_lines_with_only_whitespace_after_comment_removal(self):
+        source = "code # comment\n   \nmore_code" # The middle line becomes empty after stripping
+        expected = "code\nmore_code" # Empty line should be removed by filter
+        self.assertEqual(minify_prompt_text(source), expected)
+
+# --- Tests for CLI Integration ---
+import subprocess
+import sys
+
+# Assuming cli.py is in the parent directory of 'tests' or installed
+CLI_SCRIPT_PATH = Path(__file__).parent.parent / 'prompt_gen' / 'cli.py'
+
+class TestCLIIntegration(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.test_dir_path = Path(self.test_dir.name)
+
+    def tearDown(self):
+        self.test_dir.cleanup()
+
+    def _run_cli(self, args):
+        base_command = [sys.executable, str(CLI_SCRIPT_PATH)]
+        process = subprocess.run(base_command + args, capture_output=True, text=True, cwd=self.test_dir_path)
+        return process
+
+    def _create_file(self, name, content):
+        file_path = self.test_dir_path / name
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w') as f:
+            f.write(content)
+        return file_path
+
+    def test_minify_option_single_file(self):
+        file_content = "  line1 # comment  \n\n\n  line2  // comment\n/* block \n comment */ line3"
+        expected_minified = "//test_file.py\nline1\n\nline2\nline3" # Note: relative path from cwd of subprocess
+        self._create_file("test_file.py", file_content)
+        
+        process = self._run_cli(['-f', 'test_file.py', '--minify'])
+        self.assertEqual(process.returncode, 0)
+        # Normalize newlines in output for comparison across platforms
+        actual_output = process.stdout.replace('\r\n', '\n').strip()
+        # The processing summary is printed to stdout, so we need to find the actual content part
+        self.assertTrue(expected_minified in actual_output, f"Expected:\n{expected_minified}\nActual:\n{actual_output}")
+
+
+    def test_no_minify_option_single_file(self):
+        file_content = "  line1 # comment  \n\n\n  line2  // comment\n/* block \n comment */ line3"
+        # Expected output will include the "Processing Summary:" etc.
+        # We check for the raw content being present.
+        # The file path comment should also be unminified if the whole output isn't minified.
+        # Current behavior is that file content is NOT minified individually if global minify is off
+        
+        self._create_file("test_file.py", file_content)
+        process = self._run_cli(['-f', 'test_file.py'])
+        self.assertEqual(process.returncode, 0)
+        actual_output = process.stdout.replace('\r\n', '\n')
+
+        # Check that the original (non-minified) content is part of the output.
+        # The read_files prepends "//{file_path}\n" to content
+        expected_raw_output_segment = "//test_file.py\n" + file_content
+        self.assertTrue(expected_raw_output_segment in actual_output, f"Expected raw segment:\n{expected_raw_output_segment}\nActual output:\n{actual_output}")
+
+
+    def test_minify_with_save_option(self):
+        file_content = "  line_A # comment  \n\n\n  line_B  // comment"
+        expected_minified_in_file = "//file_to_save.py\nline_A\n\nline_B"
+        
+        self._create_file("file_to_save.py", file_content)
+        output_save_path = self.test_dir_path / "output.txt"
+        
+        process = self._run_cli(['-f', 'file_to_save.py', '--minify', '-s', str(output_save_path)])
+        self.assertEqual(process.returncode, 0)
+        self.assertTrue(output_save_path.exists())
+        
+        with open(output_save_path, 'r') as f:
+            saved_content = f.read().replace('\r\n', '\n').strip()
+        self.assertEqual(saved_content, expected_minified_in_file)
+
+    def test_minify_multiple_files(self):
+        content1 = "file1 line1 # comment\n\n\nfile1 line2"
+        content2 = "  file2 lineA // comment\n/* block */ file2 lineB  "
+        self._create_file("f1.txt", content1)
+        self._create_file("f2.txt", content2)
+
+        expected_output_segment1 = "//f1.txt\nfile1 line1\n\nfile1 line2"
+        expected_output_segment2 = "//f2.txt\nfile2 lineA\nfile2 lineB"
+        
+        process = self._run_cli(['-f', 'f1.txt', 'f2.txt', '--minify'])
+        self.assertEqual(process.returncode, 0)
+        actual_output = process.stdout.replace('\r\n', '\n').strip()
+        
+        self.assertTrue(expected_output_segment1 in actual_output)
+        self.assertTrue(expected_output_segment2 in actual_output)
+        # Check order and combined output
+        # The order of files passed to -f is not guaranteed to be preserved by os.walk or listdir in all cases,
+        # though for direct file lists it usually is.
+        # For simplicity, we check for inclusion. A more robust test might sort file paths.
+        # The final output is minified globally, so the two segments should be joined by \n\n if minify_prompt_text works correctly
+        combined_expected = expected_output_segment1 + "\n\n" + expected_output_segment2
+        # Check if the combined (and then globally minified) output contains this structure.
+        # The global minification might reduce newlines between file contents.
+        # Minify function reduces \n{3,} to \n\n.
+        # Output structure is: //file1\ncontent1\n//file2\ncontent2
+        # If content1 ends with \n\n and content2 starts, it becomes \n\n\n, then minified to \n\n.
+        # If content1 ends with \n and content2 starts, it's \n\n.
+        # The current `minify_prompt_text` joins lines with `\n` then collapses `\n{3,}` to `\n\n`.
+        # The output list has `//filepath` and `content` as separate items.
+        # `\n`.join([..., prev_content, '//next_file', next_content, ...])
+        # So if prev_content doesn't end with \n, it will be prev_content\n//next_file
+        # If prev_content ends with \n, it will be prev_content//next_file (after minify_prompt_text's initial join)
+        # This needs careful checking.
+        # Current read_files appends `//filepath` and `content` to a list `output`.
+        # Then `\n`.join(output).
+        # So it's like:
+        # //f1.txt
+        # file1 line1
+        #
+        # file1 line2
+        # //f2.txt
+        # file2 lineA
+        # file2 lineB
+        # This structure, when passed to `minify_prompt_text`, should have its internal newlines handled correctly.
+        # The `\n\n` between `file1 line2` and `//f2.txt` is expected.
+        
+        self.assertTrue(combined_expected in actual_output, f"Expected combined:\n{combined_expected}\nActual:\n{actual_output}")
+
+
+    def test_filepath_comment_format_minify(self):
+        self._create_file("test.py", "content")
+        process = self._run_cli(['-f', 'test.py', '--minify'])
+        self.assertEqual(process.returncode, 0)
+        actual_output = process.stdout.replace('\r\n', '\n')
+        # Path might be absolute or relative depending on how Popen resolves it.
+        # The cli.py uses os.path.abspath, but the output is `//{file_path}` where file_path is from all_files_to_process
+        # which is constructed from os.path.join(root, file) or the direct path if it's a file.
+        # In these tests, we pass relative paths 'test.py'.
+        self.assertTrue("//test.py\ncontent" in actual_output)
+
+    def test_filepath_comment_format_no_minify(self):
+        self._create_file("test.py", "content")
+        process = self._run_cli(['-f', 'test.py'])
+        self.assertEqual(process.returncode, 0)
+        actual_output = process.stdout.replace('\r\n', '\n')
+        self.assertTrue("//test.py\ncontent" in actual_output)

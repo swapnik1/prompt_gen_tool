@@ -6,6 +6,7 @@ import sys
 import traceback
 import logging
 import mimetypes
+import re
 
 DEFAULT_INPUT_LIMIT = 50000
 DEFAULT_MAX_FILE_SIZE = 1024 * 1024  # 1 MB max file size
@@ -16,6 +17,52 @@ DEFAULT_EXCLUDED_DIRS = [
     '.next', '.vercel',
     '.venv', 'venv', 'env'
 ]
+
+def minify_prompt_text(text: str) -> str:
+    """
+    Minifies the given text by removing unnecessary whitespace and comments.
+
+    Args:
+        text: The input string to minify.
+
+    Returns:
+        The minified string.
+    """
+    if not text:
+        return ""
+
+    # Remove multi-line Python comments ('''...''' and """...""")
+    text = re.sub(r"\'\'\'[\s\S]*?\'\'\'", "", text)
+    text = re.sub(r"\"\"\"[\s\S]*?\"\"\"", "", text)
+
+    # Remove multi-line C-style comments (/*...*/)
+    text = re.sub(r"/\*[\s\S]*?\*/", "", text)
+
+    lines = text.splitlines()
+    minified_lines = []
+
+    for line in lines:
+        # Remove single-line comments (# and //)
+        line = re.sub(r"^\s*#.*", "", line)
+        line = re.sub(r"^\s*//.*", "", line)
+        
+        # Strip leading/trailing whitespace from the line
+        stripped_line = line.strip()
+        minified_lines.append(stripped_line)
+
+    # Filter out empty lines that were purely comments or whitespace
+    minified_lines = [line for line in minified_lines if line]
+
+    # Join lines and handle consecutive newlines
+    if not minified_lines:
+        return ""
+        
+    processed_text = "\n".join(minified_lines)
+    
+    # Replace multiple newlines (3 or more) with two newlines
+    processed_text = re.sub(r'\n{3,}', '\n\n', processed_text)
+    
+    return processed_text
 
 class DetailedFileError(Exception):
     """Detailed exception for file processing errors."""
@@ -33,14 +80,17 @@ class DetailedFileError(Exception):
 class ProjectContextReader:
     def __init__(self,
                  input_limit=DEFAULT_INPUT_LIMIT,
-                 max_file_size=DEFAULT_MAX_FILE_SIZE):
+                 max_file_size=DEFAULT_MAX_FILE_SIZE,
+                 minify=False):
         """
         Initialize the ProjectContextReader with configurable parameters.
         :param input_limit: Maximum total input length
         :param max_file_size: Maximum size of individual files to read
+        :param minify: Boolean indicating whether to minify file content
         """
         self.input_limit = input_limit
         self.max_file_size = max_file_size
+        self.minify = minify
         self.total_length = 0
         self.processed_files = []
         self.skipped_files = []
@@ -275,15 +325,25 @@ class ProjectContextReader:
                     with open(file_path, 'rb') as f:
                         content = f.read().decode('utf-8', errors='replace')
 
-                # Check file size
-                if len(content) > self.max_file_size:
-                    self.skipped_files.append((file_path, f"File too large (>{self.max_file_size} bytes)"))
+                # Minify content if required
+                if self.minify:
+                    content = minify_prompt_text(content)
+
+                # Check file size (of potentially minified content)
+                if len(content) > self.max_file_size: # This check should ideally be on original size, but spec implies minified.
+                                                      # For now, let's assume check is on content to be added.
+                    self.skipped_files.append((file_path, f"File too large (>{self.max_file_size} bytes post-minify)"))
+                    continue
+                
+                # If after minification, content is empty, skip adding it (unless it was empty to begin with)
+                if not content and os.path.getsize(file_path) > 0 : # Check original size to ensure it wasn't an empty file
+                    self.skipped_files.append((file_path, "Content became empty after minification"))
                     continue
 
                 # Track processed files and content
                 self.processed_files.append(file_path)
-                self.total_length += len(content)
-                output.append(f"\n//{file_path}")
+                self.total_length += len(content) # Add length of (potentially) minified content
+                output.append(f"//{file_path}") # No leading newline here, handled by join
                 output.append(content)
 
                 # Break if total length exceeds limit
@@ -306,7 +366,12 @@ class ProjectContextReader:
             print("\nSkipped Files:")
             for file, reason in self.skipped_files:
                 print(f"  {file}: {reason}")
-        return '\n'.join(output)
+        
+        full_output_str = '\n'.join(output)
+        if self.minify:
+            return minify_prompt_text(full_output_str)
+        else:
+            return full_output_str
 
 def main():
     parser = argparse.ArgumentParser(description="Advanced Project Context Reader")
@@ -316,6 +381,7 @@ def main():
     parser.add_argument('-e', '--exclude', nargs='+', default=[], help="Additional files or directories to exclude")
     parser.add_argument('--max-depth', type=int, help="Maximum directory depth to traverse")
     parser.add_argument('--input-limit', type=int, default=DEFAULT_INPUT_LIMIT, help="Maximum total input length")
+    parser.add_argument('--minify', action='store_true', help="Minify the output by removing unnecessary characters.")
 
     try:
         args = parser.parse_args()
@@ -328,7 +394,8 @@ def main():
 
         # Initialize reader
         reader = ProjectContextReader(
-            input_limit=args.input_limit
+            input_limit=args.input_limit,
+            minify=args.minify
         )
 
         # Generate output

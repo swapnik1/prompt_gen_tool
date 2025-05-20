@@ -59,6 +59,7 @@ prompt-gen -f src/ --gitignore .gitignore
 - `--max-depth`: Maximum directory depth to traverse
 - `--input-limit`: Maximum total input length (default: 12000 chars)
 - `--max-file-size`: Maximum file size to read (default: 1 MB)
+- `--minify`: Optional. Minifies the output by removing unnecessary characters such as excessive newlines, leading/trailing whitespace, and comments. This can help reduce the token count for LLMs.
 
 ## Development and Testing
 
